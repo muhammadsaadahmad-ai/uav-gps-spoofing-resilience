@@ -221,7 +221,7 @@ def main():
     times, errors = compute_drift(dr, gps)
 
     print(f"GPS samples: {len(gps)}")
-    print(f"Dead-reckoning position error (meters) vs GPS ground truth:")
+    print("Dead-reckoning position error (meters) vs GPS ground truth:")
     print(f"  mean:  {errors.mean():.3f} m")
     print(f"  max:   {errors.max():.3f} m")
     print(f"  final: {errors[-1]:.3f} m  (at t={times[-1] - times[0]:.1f}s into the log)")

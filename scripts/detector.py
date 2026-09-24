@@ -101,6 +101,111 @@ Changes from v2:
   fixed WINDOW_SECONDS made, but now used to characterize a rate rather
   than picked as a magic absolute distance threshold.
 
+Changes from v3 (this version): adds a SECOND, independent detection path
+for INSTANTANEOUS jumps, which the CUSUM path above is structurally blind
+to. Smoke-tested directly against a new "sudden_jump" attack type (a fixed
+offset applied in a single sample, no ramp): TP=0, FN=546, precision=0,
+recall=0 -- the CUSUM path never fired at all. Root cause: a one-sample
+step to a new CONSTANT offset produces only a single-sample derivative
+spike; both the 3s and 15s trailing-slope windows average it away almost
+immediately, so slope_gap barely moves and cusum_stat never approaches h.
+This is not a bug in the CUSUM design -- it is precisely what "detect a
+SUSTAINED change in growth rate" is supposed to ignore -- it is a genuine
+blind spot for a *different* attack shape that needs its own signal.
+
+  1. jump_delta_m[i] = |(spoofed[i]-spoofed[i-1]) - (dr[i]-dr[i-1])|, the
+     magnitude of the CHANGE in the (spoofed-dr) gap VECTOR -- not
+     |divergence[i]-divergence[i-1]| (the difference of the gap's
+     MAGNITUDE), and not raw GPS-position displacement. Both alternatives
+     were tried first and both failed for reasons only visible against
+     real data, not assumed:
+
+       - |divergence[i]-divergence[i-1]| (first attempt) is a difference
+         of magnitudes, which the reverse triangle inequality permits to
+         be much SMALLER than the actual change in the gap. Caught this
+         directly against the sudden_jump validation flight: a 5m jump
+         injected at t=37s, once dead-reckoning had already drifted
+         ~21m from truth in some other direction, produced only a
+         ~1.0m change in |divergence| -- the injected offset partially
+         CANCELLED the pre-existing drift vector. The jump detector
+         missed the attack entirely (TP=0) on the first implementation,
+         not because the threshold was miscalibrated but because the
+         chosen quantity itself was silently attenuating late-onset
+         jumps. The vector-difference form doesn't have this problem:
+         since DR's own sample-to-sample movement is always tiny
+         (real vehicle dynamics, not attacker-controlled), the vector
+         difference is dominated by however much the SPOOFED position
+         jumped, regardless of the pre-existing drift magnitude or
+         direction -- confirmed on the same flight: the vector form
+         reads 4.86m at that exact same jump sample, matching the
+         injected 5m offset almost exactly.
+
+       - Raw GPS-position displacement (considered, not implemented) was
+         also checked against data and rejected: several trials'
+         calibration windows fall during a hover/stabilize hold before
+         any velocity command runs (moderate_fast_drift's calibration
+         window has EXACTLY 0.0 displacement), which would calibrate a
+         near-zero threshold that fires on any subsequent real motion at
+         all; and real per-sample motion during "aggressive"-style
+         maneuvering reaches up to 1.28m, too close to a 5m attack to
+         leave a hardcoded floor that's both safe and sensitive. The
+         (spoofed-dr) vector-difference doesn't have this problem either:
+         during genuine vehicle motion, both the spoofed feed and DR are
+         tracking the SAME real movement, so they mostly cancel in the
+         difference, leaving only their (small) disagreement -- unlike
+         raw position displacement, which sees the full real velocity as
+         "signal" regardless of whether DR agrees with it.
+
+  2. Calibrated the same principled way as CUSUM's k/h (a fixed early
+     boot-time window, verified against real per-flight data, not a
+     hardcoded guess) -- but off that window's MAX, not mean or std, for
+     a reason verified directly against this project's own trials:
+     jump_delta_m is a bursty, maneuver-driven signal, not a stationary
+     noisy one. aggressive_fast_drift's own 10s calibration window has
+     jump_delta mean=0.033m, std=0.007m -- but later in that SAME
+     pre-attack flight, once ambient DR drift has grown large, jump_delta
+     spikes to 0.989m, a real dynamical event, ~20x the calibration
+     window's own max. A std- or mean-based threshold from the early
+     window would have been blown through by this later, otherwise-benign
+     maneuvering spike -- the same "SITL's near-zero early-window noise
+     doesn't bound real later variance" lesson CUSUM's own k/h derivation
+     already had to learn, one level down.
+
+     A pure "calibration max x multiplier" wasn't enough by itself,
+     though -- checked directly against the new circular/figure_eight/
+     sustained_cruise profiles, not assumed: the circular-profile flight's
+     own calibration window has a ~4x higher baseline jump_delta max
+     (0.198m) than aggressive_fast_drift's (0.049m), just from being a
+     continuously-turning profile rather than mostly straight segments.
+     A multiplier sized to safely clear aggressive_fast_drift's 20x
+     worst-case ratio (needs ~30x) becomes too LOOSE when applied to
+     circular's already-higher baseline (30 x 0.198m = 5.94m -- bigger
+     than the 5m attack itself, which would have missed it again). So
+     the threshold is min(JUMP_THRESHOLD_MULT * calib_max,
+     JUMP_THRESHOLD_CEILING_M): the relative multiplier gives real
+     margin on quiet flights with a tiny genuine calibration baseline,
+     and the absolute ceiling stops a single noisier-baseline flight
+     from inflating the threshold past where it can still catch a
+     real attack. Both constants are justified with exact numbers in
+     their own comments below, verified against every trial and
+     validation flight available in this project, not picked upfront.
+
+  3. Latched exactly like the CUSUM alarm -- once jump_delta_m crosses
+     its threshold, this signal stays fired for the rest of the flight
+     (same "a security alarm should not silently self-clear" principle).
+
+  4. Combined with the CUSUM alarm via OR: predicted_spoofed = 1 if
+     EITHER latch has fired. Each signal's own internal logic (CUSUM's
+     slope-gap accumulator, the jump latch's threshold crossing) is
+     untouched by the other -- this is a detection-level OR, not a
+     shared statistic.
+
+CALIBRATION_DURATION_S is a fixed early window assumed attack-free (a
+boot-time calibration hold), the same category of assumption v2's fixed
+WINDOW_SECONDS made, but now used to characterize a rate (and, as of this
+version, a jump-size ceiling) rather than picked as a magic absolute
+distance threshold.
+
 Usage (unchanged):
     python3 detector.py spoofed_gps.csv dead_reckoning_output.csv
 """
@@ -124,6 +229,47 @@ MIN_CALIBRATION_SAMPLES = 20
 # (not std -- see module docstring for why std is unreliable here) ---
 CUSUM_K_MULT = 0.5   # slack: half the baseline rate is "normal" fluctuation
 CUSUM_H_MULT = 2.0   # alarm once sustained excess reaches the baseline rate again
+
+# --- Jump-detector parameters. threshold = min(JUMP_THRESHOLD_MULT *
+# calib_max, JUMP_THRESHOLD_CEILING_M), floored at MIN_JUMP_THRESHOLD_M
+# -- see module docstring for the full reasoning; summarized here with
+# the exact numbers that produced each constant.
+#
+# JUMP_THRESHOLD_MULT: a multiple of the calibration window's MAX
+# per-sample jump_delta_m (not mean/std -- this signal is bursty/
+# maneuver-driven, so mean/std from a calm early window badly
+# underestimate a later real maneuvering spike; verified directly:
+# aggressive_fast_drift's calibration window has jump_delta max=0.049m,
+# but later in that SAME pre-attack flight it spikes to 0.989m, a real
+# maneuvering event, ~20x the calibration window's own max). 30x gives
+# that specific (worst-observed) case ~1.5x margin above its own worst
+# pre-attack spike.
+JUMP_THRESHOLD_MULT = 30.0
+#
+# JUMP_THRESHOLD_CEILING_M: an absolute cap on top of the multiplier,
+# needed because the relative multiplier alone doesn't transfer safely
+# across flights with different inherent baseline noise -- verified
+# directly: the circular-profile validation flight's calibration window
+# has a jump_delta max of 0.198m, ~4x aggressive_fast_drift's 0.049m,
+# just from being a continuously-turning profile. JUMP_THRESHOLD_MULT
+# sized for aggressive_fast_drift's worst case would give circular's
+# flight a threshold of 30*0.198=5.94m -- ABOVE the 5m sudden_jump
+# attack, which would miss it again. 2.5m sits below every attack this
+# project tests (the 5m sudden_jump case clears it by ~1.9-3.4x
+# depending on how much the vector-difference signal is itself affected
+# by that flight's own noise) while still clearing every trial and
+# validation flight's own strict pre-attack (t < attack_start_t) max by
+# at least 1.5x -- verified against all 6 original trials plus the
+# circular-profile sudden_jump/intermittent validation flights, not
+# just the one worst case.
+JUMP_THRESHOLD_CEILING_M = 2.5
+#
+# Defensive floor in case a calibration window happens to be perfectly
+# static (calib max == 0) -- never engaged by any trial or validation
+# flight in this project (all have calib max >= 0.049m), but without it
+# a zero-noise calibration window would produce a zero threshold that
+# fires on any nonzero jitter at all.
+MIN_JUMP_THRESHOLD_M = 0.5
 
 
 def nearest_index(sorted_times, t):
@@ -184,6 +330,19 @@ def detect(df):
         df["spoofed_y_m"].values - df["dr_y"].values,
     )
 
+    # Magnitude of the sample-to-sample CHANGE in the (spoofed-dr) gap
+    # VECTOR -- the signal the jump-detection path below is built on.
+    # Independent of slope_gap/CUSUM; see module docstring for why this
+    # (not |divergence[i]-divergence[i-1]|, not raw GPS displacement) is
+    # what reliably catches sudden_jump attacks regardless of how much
+    # ambient DR drift has already accumulated. jump_delta[0] is defined
+    # as 0 (no prior sample to diff against) via prepend.
+    d_spoofed_x = np.diff(df["spoofed_x_m"].values, prepend=df["spoofed_x_m"].values[0])
+    d_spoofed_y = np.diff(df["spoofed_y_m"].values, prepend=df["spoofed_y_m"].values[0])
+    d_dr_x = np.diff(df["dr_x"].values, prepend=df["dr_x"].values[0])
+    d_dr_y = np.diff(df["dr_y"].values, prepend=df["dr_y"].values[0])
+    jump_delta = np.hypot(d_spoofed_x - d_dr_x, d_spoofed_y - d_dr_y)
+
     short_slope = np.array([_trailing_slope(t, divergence, i, SHORT_WINDOW_S) for i in range(n)])
     long_slope = np.array([_trailing_slope(t, divergence, i, LONG_WINDOW_S) for i in range(n)])
     slope_gap = short_slope - long_slope  # ~stationary under smooth ambient drift
@@ -204,6 +363,8 @@ def detect(df):
         df["divergence_m"] = divergence
         df["slope_gap_mps"] = slope_gap
         df["cusum_stat"] = np.zeros(n)
+        df["jump_delta_m"] = jump_delta
+        df["jump_alarm"] = np.zeros(n, dtype=int)
         df["predicted_spoofed"] = np.zeros(n, dtype=int)
         return df
 
@@ -213,7 +374,7 @@ def detect(df):
 
     residual = slope_gap - baseline_gap
     cusum = np.zeros(n)
-    predicted = np.zeros(n, dtype=int)
+    cusum_predicted = np.zeros(n, dtype=int)
     alarmed = False
     for i in range(1, n):
         if np.isnan(residual[i]):
@@ -222,17 +383,43 @@ def detect(df):
             cusum[i] = max(0.0, cusum[i - 1] + residual[i] - k)
             if cusum[i] > h:
                 alarmed = True
-        predicted[i] = 1 if alarmed else 0  # latched: a raised alarm doesn't self-clear
+        cusum_predicted[i] = 1 if alarmed else 0  # latched: a raised alarm doesn't self-clear
+
+    # --- Jump-detection path (independent of CUSUM above; see module
+    # docstring for why the threshold basis/multiplier were chosen this
+    # way). Calibrated from the SAME fixed early window as CUSUM, off
+    # that window's MAX per-sample jump (not mean/std -- see docstring).
+    calib_jump_max = float(jump_delta[calib_mask].max())
+    jump_threshold = min(
+        max(JUMP_THRESHOLD_MULT * calib_jump_max, MIN_JUMP_THRESHOLD_M),
+        JUMP_THRESHOLD_CEILING_M,
+    )
+
+    jump_alarm = np.zeros(n, dtype=int)
+    jump_alarmed = False
+    for i in range(1, n):
+        if jump_delta[i] > jump_threshold:
+            jump_alarmed = True
+        jump_alarm[i] = 1 if jump_alarmed else 0  # latched, same principle as CUSUM's
+
+    # --- Combine: predicted_spoofed = 1 if EITHER latch has fired.
+    # Detection-level OR only -- neither signal's own internal logic
+    # (CUSUM's accumulator above, the jump latch above) is touched here.
+    predicted = np.maximum(cusum_predicted, jump_alarm)
 
     df = df.copy()
     df["divergence_m"] = divergence
     df["slope_gap_mps"] = slope_gap
     df["cusum_stat"] = cusum
+    df["jump_delta_m"] = jump_delta
+    df["jump_alarm"] = jump_alarm
     df["predicted_spoofed"] = predicted
     df.attrs["baseline_gap_mps"] = baseline_gap
     df.attrs["cusum_k"] = k
     df.attrs["cusum_h"] = h
     df.attrs["n_calib"] = n_calib
+    df.attrs["calib_jump_max_m"] = calib_jump_max
+    df.attrs["jump_threshold_m"] = jump_threshold
     return df
 
 
@@ -253,6 +440,16 @@ def evaluate(df):
         print(f"Calibration: {df.attrs['n_calib']} samples, "
               f"baseline slope_gap={df.attrs['baseline_gap_mps']:.4f} m/s, "
               f"k={df.attrs['cusum_k']:.4f}, h={df.attrs['cusum_h']:.4f}")
+        print(f"Jump-detector calibration: calib max jump_delta="
+              f"{df.attrs['calib_jump_max_m']:.4f} m, "
+              f"threshold={df.attrs['jump_threshold_m']:.4f} m")
+
+    if "jump_alarm" in df.columns:
+        jump_arr = df["jump_alarm"].values
+        jump_fired = bool(jump_arr.max()) if len(jump_arr) else False
+        jump_first_idx = int(np.argmax(jump_arr == 1)) if jump_fired else None
+        print(f"Jump-detector latch fired this run? {jump_fired}"
+              + (f" (first at t={df['t'].iloc[jump_first_idx]:.2f})" if jump_fired else ""))
 
     print(f"Confusion matrix: TP={tp} FP={fp} FN={fn} TN={tn}")
     print(f"Precision: {precision:.3f}")
@@ -281,7 +478,6 @@ def evaluate(df):
         # Where do the false positives actually sit relative to the attack
         # boundary? This is the check that caught v2's confound -- keep
         # doing it explicitly rather than trusting a clean-looking F1.
-        t0 = df["t"].iloc[0]
         t_attack = df["t"].iloc[attack_start_idx]
         fp_idx = np.where((y_true == 0) & (y_pred == 1))[0]
         if len(fp_idx) == 0:

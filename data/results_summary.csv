@@ -1,0 +1,7 @@
+velocity_profile,attack_profile,status,flight_duration_s,imu_sample_rate_hz,dr_drift_mean_m,dr_drift_max_m,dr_drift_final_m,attack_start_t_s,tp,fp,fn,tn,precision,recall,f1,detection_latency_s,identical_to_naive_rule,fp_note,max_displacement_m
+gentle,slow_drift,OK,67.05,49.4,4.322,13.854,13.854,20.1,453,0,11,200,1.0,0.976,0.988,1.1,False,none,20.59
+gentle,fast_drift,OK,67.82,49.5,13.198,40.996,40.996,40.7,263,0,5,404,1.0,0.981,0.991,0.8,False,none,20.6
+moderate,slow_drift,OK,81.16,49.4,23.266,70.509,70.509,24.3,546,0,16,241,1.0,0.972,0.986,1.5,False,none,64.92
+moderate,fast_drift,OK,80.94,49.5,26.286,77.48,77.48,48.6,312,0,8,481,1.0,0.975,0.987,0.8,False,none,64.83
+aggressive,slow_drift,OK,79.58,49.4,10.329,21.979,21.978,23.9,530,0,19,238,1.0,0.965,0.982,2.11,False,none,38.15
+aggressive,fast_drift,OK,80.39,49.0,13.816,36.623,36.623,48.2,289,0,29,477,1.0,0.909,0.952,2.9,False,none,38.04
